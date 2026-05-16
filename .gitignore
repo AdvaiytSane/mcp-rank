@@ -1,0 +1,20 @@
+# Secrets / credentials
+.env
+.env.*
+secrets.json
+credentials.json
+*.key
+*.pem
+
+# AMN runtime artifacts
+rank_file.json
+rank_file.json.lock
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+
+# macOS
+.DS_Store

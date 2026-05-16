@@ -6,7 +6,10 @@ import asyncio
 import time
 import struct
 import base64
+import os
 import requests
+from dotenv import load_dotenv
+load_dotenv()
 from src.agent.capability import MatchingCapability
 from src.main import AgentWorker
 from src.agent.capability_worker import CapabilityWorker
@@ -77,8 +80,8 @@ MAX_HISTORY_MESSAGES = 16
 MAX_RECENT_SPEECH = 20                 # Rolling buffer of recent speech lines
 
 DASHBOARD_URL = "https://file-sender.replit.app/api"
-DEEPGRAM_API_KEY = "DEEPGRAM_API_KEY_REDACTED"
-OPENROUTER_API_KEY = "OPENROUTER_API_KEY_REDACTED"
+DEEPGRAM_API_KEY = os.environ["DEEPGRAM_API_KEY"]
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 
 # --- Models ---
 AUDIO_ANALYSIS_MODEL = "google/gemini-3-flash-preview"   # Must support audio input

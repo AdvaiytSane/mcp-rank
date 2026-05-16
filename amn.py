@@ -11,6 +11,8 @@ Usage:
 import json
 import os
 import random
+from dotenv import load_dotenv
+load_dotenv()
 import argparse
 import math
 import time
@@ -36,8 +38,8 @@ MAX_STEPS = 20
 RANK_FILE = "rank_file.json"
 LOCK_FILE = "rank_file.json.lock"
 
-# OpenRouter config (keys from LifeLogger)
-OPENROUTER_API_KEY = "OPENROUTER_API_KEY_REDACTED"
+# OpenRouter config
+OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "google/gemini-2.0-flash-001"
 
