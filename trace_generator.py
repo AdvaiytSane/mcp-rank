@@ -173,7 +173,7 @@ def generate_all_traces(n_per_profile: int = 10) -> list:
 
 
 def bootstrap_rank_file(embed_model):
-    """Generate synthetic traces, build Markov policy, save to rank_file.json."""
+    """Generate synthetic traces, build Markov policy, load into in-memory store."""
     print("[bootstrap] Generating synthetic training traces...")
     traces = generate_all_traces(n_per_profile=10)
     print(f"[bootstrap] Generated {len(traces)} traces ({len(BUYER_PROFILES)} profiles × 10 each)")
@@ -187,7 +187,7 @@ def bootstrap_rank_file(embed_model):
 
     buckets = seed_initial_buckets(embed_model)
     save_rank_file(buckets, policy, {"source": "synthetic_bootstrap"})
-    print(f"[bootstrap] rank_file.json created with {len(traces)} training runs worth of data")
+    print(f"[bootstrap] In-memory store loaded with {len(traces)} training runs worth of data")
     print("[bootstrap] Warm run will benefit immediately from this policy")
 
     # Show a sample of the learned policy

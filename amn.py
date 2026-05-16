@@ -18,7 +18,6 @@ import math
 import time
 from dataclasses import dataclass, field
 from typing import Optional
-from filelock import FileLock
 import numpy as np
 import requests
 from sentence_transformers import SentenceTransformer
@@ -35,8 +34,9 @@ STATES = [
 
 CONFIDENCE_THRESHOLD = 0.70
 MAX_STEPS = 20
-RANK_FILE = "rank_file.json"
-LOCK_FILE = "rank_file.json.lock"
+
+# In-memory store — persists for the lifetime of the process (across multiple calls)
+_MEMORY_STORE: dict = {"version": 1, "total_runs": 0, "buckets": [], "global_policy": {}}
 
 # OpenRouter config
 OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
@@ -208,11 +208,7 @@ def retrieve_bucket(embedding: list, buckets: list) -> Optional[dict]:
 
 
 def load_rank_file() -> tuple:
-    if not os.path.exists(RANK_FILE):
-        return [], {}
-    with open(RANK_FILE) as f:
-        data = json.load(f)
-    return data.get("buckets", []), data.get("global_policy", {})
+    return _MEMORY_STORE.get("buckets", []), _MEMORY_STORE.get("global_policy", {})
 
 
 def _merge_policy_entries(base: dict, update: dict) -> dict:
@@ -235,32 +231,22 @@ def _merge_policy_entries(base: dict, update: dict) -> dict:
 
 
 def save_rank_file(buckets: list, global_policy: dict, run_meta: dict = None):
-    with FileLock(LOCK_FILE):
-        if os.path.exists(RANK_FILE):
-            with open(RANK_FILE) as f:
-                existing = json.load(f)
+    existing = _MEMORY_STORE
+
+    existing["global_policy"] = _merge_policy_entries(existing["global_policy"], global_policy)
+
+    existing_bucket_map = {b["bucket_id"]: b for b in existing["buckets"]}
+    for b in buckets:
+        bid = b["bucket_id"]
+        if bid not in existing_bucket_map:
+            existing_bucket_map[bid] = b
         else:
-            existing = {"version": 1, "total_runs": 0, "buckets": [], "global_policy": {}}
+            eb = existing_bucket_map[bid]
+            eb["markov_policy"] = _merge_policy_entries(eb["markov_policy"], b["markov_policy"])
+            eb["run_count"] = eb.get("run_count", 0) + b.get("run_count", 0)
 
-        # Merge global policy
-        existing["global_policy"] = _merge_policy_entries(existing["global_policy"], global_policy)
-
-        # Merge buckets (match by bucket_id)
-        existing_bucket_map = {b["bucket_id"]: b for b in existing["buckets"]}
-        for b in buckets:
-            bid = b["bucket_id"]
-            if bid not in existing_bucket_map:
-                existing_bucket_map[bid] = b
-            else:
-                eb = existing_bucket_map[bid]
-                eb["markov_policy"] = _merge_policy_entries(eb["markov_policy"], b["markov_policy"])
-                eb["run_count"] = eb.get("run_count", 0) + b.get("run_count", 0)
-
-        existing["buckets"] = list(existing_bucket_map.values())
-        existing["total_runs"] = existing.get("total_runs", 0) + 1
-
-        with open(RANK_FILE, "w") as f:
-            json.dump(existing, f, indent=2)
+    existing["buckets"] = list(existing_bucket_map.values())
+    existing["total_runs"] = existing.get("total_runs", 0) + 1
 
 
 def merge_for_lookup(bucket_policy: dict, global_policy: dict) -> dict:
@@ -773,9 +759,7 @@ def main():
     print(f"  {GREEN}{step_diff} fewer steps{RESET} ({len(cold_logs)} → {len(warm_logs)})")
     print(f"  {GREEN}${cost_diff:.4f} cost reduction{RESET} (${cold_cost:.4f} → ${warm_cost:.4f})")
 
-    with open(RANK_FILE) as f:
-        rf = json.load(f)
-    print(f"\n[AMN Network] rank_file.json total_runs: {rf.get('total_runs', 0)} (shared across all users)")
+    print(f"\n[AMN Network] In-memory store total_runs: {_MEMORY_STORE.get('total_runs', 0)} (shared across calls this session)")
 
 
 if __name__ == "__main__":
