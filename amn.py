@@ -9,10 +9,7 @@ Usage:
 """
 
 import json
-import os
 import random
-from dotenv import load_dotenv
-load_dotenv()
 import argparse
 import math
 import time
@@ -39,7 +36,7 @@ MAX_STEPS = 20
 _MEMORY_STORE: dict = {"version": 1, "total_runs": 0, "buckets": [], "global_policy": {}}
 
 # OpenRouter config
-OPENROUTER_API_KEY = os.environ["OPENROUTER_API_KEY"]
+OPENROUTER_API_KEY = "OPENROUTER_API_KEY_REDACTED"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "google/gemini-2.0-flash-001"
 
