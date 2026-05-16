@@ -719,7 +719,7 @@ def main():
     print(f"Loaded policy: {sum(len(v) for v in global_policy.values())} state-action pairs from shared memory\n")
 
     if args.lifelogger:
-        print("LifeLogger mode: connect your EnhancedListenerCapability instance and pass to from_lifelogger()")
+        print("LifeLogger mode: import lifelogger and pass an EnhancedListenerCapability instance to from_lifelogger()")
         print("Falling back to demo text for now.")
 
     random.seed(42)
