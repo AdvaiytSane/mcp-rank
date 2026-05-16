@@ -35,8 +35,7 @@ MAX_STEPS = 20
 # In-memory store — persists for the lifetime of the process (across multiple calls)
 _MEMORY_STORE: dict = {"version": 1, "total_runs": 0, "buckets": [], "global_policy": {}}
 
-# OpenRouter config
-OPENROUTER_API_KEY = "OPENROUTER_API_KEY_REDACTED"
+# OpenRouter config — key read inside llm_call() to avoid module-level os import
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
 LLM_MODEL = "google/gemini-2.0-flash-001"
 
@@ -261,10 +260,12 @@ def merge_for_lookup(bucket_policy: dict, global_policy: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def llm_call(system_prompt: str, user_message: str, max_tokens: int = 100) -> str:
+    import os
+    api_key = os.environ.get("OPENROUTER_API_KEY", "")
     resp = requests.post(
         OPENROUTER_URL,
         headers={
-            "Authorization": f"Bearer {OPENROUTER_API_KEY}",
+            "Authorization": f"Bearer {api_key}",
             "Content-Type": "application/json",
         },
         json={
