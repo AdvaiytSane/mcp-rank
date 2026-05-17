@@ -12,18 +12,8 @@ from src.agent.capability import MatchingCapability
 from src.main import AgentWorker
 from src.agent.capability_worker import CapabilityWorker
 
-# Lazy imports — these are only needed by the AMN subsystem, not at capability load time
-np = None
-SentenceTransformer = None
-
-def _ensure_heavy_imports():
-    global np, SentenceTransformer
-    if np is None:
-        import numpy
-        np = numpy
-    if SentenceTransformer is None:
-        from sentence_transformers import SentenceTransformer as ST
-        SentenceTransformer = ST
+import math
+import hashlib
 
 # =============================================================================
 # ARCHITECTURE — Why it works this way
@@ -91,11 +81,14 @@ MAX_HISTORY_MESSAGES = 16
 MAX_RECENT_SPEECH = 20                 # Rolling buffer of recent speech lines
 
 DASHBOARD_URL = "https://file-sender.replit.app/api"
-DEEPGRAM_API_KEY    = "YOUR_DEEPGRAM_API_KEY"
-OPENROUTER_API_KEY  = "YOUR_OPENROUTER_API_KEY"
+
+DEEPGRAM_API_KEY    = ""   # paste your Deepgram key here
+OPENROUTER_API_KEY  = ""   # paste your OpenRouter key here
+SUPABASE_URL        = ""   # e.g. https://xxxx.supabase.co
+SUPABASE_KEY        = ""   # service_role or anon key
 
 # --- Models ---
-AUDIO_ANALYSIS_MODEL = "google/gemini-3-flash-preview"   # Must support audio input
+AUDIO_ANALYSIS_MODEL = "google/gemini-2.0-flash-001"     # Must support audio input
 ROUTER_MODEL = "google/gemini-2.0-flash-001"           # Fast text model for intent gating
 CONVERSATION_MODEL = "google/gemini-2.0-flash-001"     # Model for conversation responses
 SUMMARY_MODEL = "google/gemini-2.0-flash-001"          # Model for text summarization
@@ -2039,7 +2032,7 @@ class EnhancedListenerCapability(MatchingCapability):
     }
 
     def _is_real_estate_query(self, text: str) -> bool:
-        words = set(text.lower().split())
+        words = set(re.sub(r"[^\w\s]", " ", text.lower()).split())
         return bool(words & self._REAL_ESTATE_KEYWORDS)
 
     async def trigger_amn(self, user_input: str):
@@ -2207,31 +2200,72 @@ AMN_TOOL_COSTS = {
     "update_crm": 0.02,           "ask_clarifying_question": 0.02,
 }
 
-# Shared in-memory Markov store — persists across calls within the session
+# In-memory cache — synced to Supabase on every save
 _AMN_STORE: dict = {"total_runs": 0, "buckets": [], "global_policy": {}}
 
-# Lazy-loaded embedding model
-_amn_embed_model = None
+_SB_TABLE = "amn_store"
+_SB_ROW_ID = "singleton"
 
-def _get_embed_model():
-    global _amn_embed_model
-    if _amn_embed_model is None:
-        _ensure_heavy_imports()
-        _amn_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
-    return _amn_embed_model
+def _sb_headers() -> dict:
+    return {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=representation",
+    }
+
+def _amn_cloud_load() -> dict | None:
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return None
+    try:
+        r = requests.get(
+            f"{SUPABASE_URL}/rest/v1/{_SB_TABLE}",
+            headers=_sb_headers(),
+            params={"id": f"eq.{_SB_ROW_ID}", "select": "data"},
+            timeout=5,
+        )
+        if r.status_code == 200:
+            rows = r.json()
+            if rows:
+                return rows[0]["data"]
+    except Exception:
+        pass
+    return None
+
+def _amn_cloud_save(store: dict):
+    if not SUPABASE_URL or not SUPABASE_KEY:
+        return
+    try:
+        requests.post(
+            f"{SUPABASE_URL}/rest/v1/{_SB_TABLE}",
+            headers={**_sb_headers(), "Prefer": "resolution=merge-duplicates"},
+            params={"on_conflict": "id"},
+            json={"id": _SB_ROW_ID, "data": store},
+            timeout=5,
+        )
+    except Exception:
+        pass
 
 # ---------------------------------------------------------------------------
-# AMN Helpers
+# AMN Helpers — pure-Python embeddings, no external packages needed
 # ---------------------------------------------------------------------------
+
+_EMBED_DIM = 64
 
 def _amn_embed(text: str) -> list:
-    return _get_embed_model().encode(text).tolist()
+    """Deterministic bag-of-words sparse vector via hashing."""
+    vec = [0.0] * _EMBED_DIM
+    for word in text.lower().split():
+        idx = int(hashlib.md5(word.encode()).hexdigest(), 16) % _EMBED_DIM
+        vec[idx] += 1.0
+    norm = math.sqrt(sum(x * x for x in vec)) or 1.0
+    return [x / norm for x in vec]
 
 def _amn_cosine(a: list, b: list) -> float:
-    _ensure_heavy_imports()
-    a, b = np.array(a), np.array(b)
-    d = np.linalg.norm(a) * np.linalg.norm(b)
-    return float(np.dot(a, b) / d) if d else 0.0
+    dot = sum(x * y for x, y in zip(a, b))
+    na = math.sqrt(sum(x * x for x in a))
+    nb = math.sqrt(sum(x * x for x in b))
+    return dot / (na * nb) if na and nb else 0.0
 
 def _amn_llm(system: str, user: str, max_tokens: int = 100) -> str:
     resp = requests.post(
@@ -2275,8 +2309,12 @@ def _amn_store_save(buckets: list, policy: dict):
             bmap[bid]["markov_policy"] = _amn_merge(bmap[bid]["markov_policy"], b["markov_policy"])
     _AMN_STORE["buckets"] = list(bmap.values())
     _AMN_STORE["total_runs"] += 1
+    _amn_cloud_save(_AMN_STORE)
 
 def _amn_store_load() -> tuple:
+    cloud = _amn_cloud_load()
+    if cloud:
+        _AMN_STORE.update(cloud)
     return _AMN_STORE["buckets"], _AMN_STORE["global_policy"]
 
 def _amn_bucket_lookup(policy_bucket: dict, policy_global: dict) -> dict:
@@ -2289,7 +2327,6 @@ def _amn_bucket_lookup(policy_bucket: dict, policy_global: dict) -> dict:
     return m
 
 def _amn_seed_buckets() -> list:
-    em = _get_embed_model()
     profiles = [
         {"bucket_id": "first_time_buyer",
          "description": "First-time home buyer, moderate budget, needs guidance",
@@ -2305,7 +2342,7 @@ def _amn_seed_buckets() -> list:
          "markov_policy": {}},
     ]
     for p in profiles:
-        p["centroid"] = em.encode(p["description"]).tolist()
+        p["centroid"] = _amn_embed(p["description"])
         p["run_count"] = 0
     return profiles
 
@@ -2571,7 +2608,7 @@ def _amn_run_agent(ctx: BuyerContext, policy: dict, mode: str, buckets: list) ->
     state = _amn_classify(ctx)
     logs, total_cost = [], 0.0
     while state != "DONE" and len(logs) < AMN_MAX_STEPS:
-        emb = _get_embed_model().encode(f"{ctx.buyer_intent} {ctx.location} {ctx.budget} {state}").tolist()
+        emb = _amn_embed(f"{ctx.buyer_intent} {ctx.location} {ctx.budget} {state}")
         bucket = _amn_retrieve_bucket(emb, buckets)
         eff_policy = _amn_bucket_lookup(bucket["markov_policy"] if bucket else {}, policy)
         llm_act, markov_act, chosen, conf = _amn_choose(state, ctx, eff_policy, mode)
