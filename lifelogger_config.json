@@ -1,8 +1,9 @@
 {
-    "unique_name":"advisor",
-    "matching_hotwords":[
-        "give me advise",
-        "advise me",
-        "advice time"
+    "unique_name": "enhanced_listener",
+    "matching_hotwords": [
+        "start listening",
+        "begin session",
+        "enhanced listener",
+        "start ambient"
     ]
 }
