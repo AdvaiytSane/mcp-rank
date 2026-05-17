@@ -1,5 +1,3 @@
-
-
 import json
 import re
 import asyncio
@@ -9,12 +7,23 @@ import base64
 import random
 from dataclasses import dataclass, field
 from typing import Optional
-import numpy as np
 import requests
-from sentence_transformers import SentenceTransformer
 from src.agent.capability import MatchingCapability
 from src.main import AgentWorker
 from src.agent.capability_worker import CapabilityWorker
+
+# Lazy imports — these are only needed by the AMN subsystem, not at capability load time
+np = None
+SentenceTransformer = None
+
+def _ensure_heavy_imports():
+    global np, SentenceTransformer
+    if np is None:
+        import numpy
+        np = numpy
+    if SentenceTransformer is None:
+        from sentence_transformers import SentenceTransformer as ST
+        SentenceTransformer = ST
 
 # =============================================================================
 # ARCHITECTURE — Why it works this way
@@ -63,7 +72,7 @@ from src.agent.capability_worker import CapabilityWorker
 #   - Gemini's claims are cross-validated against Deepgram's speaker count.
 #   - When they disagree, Deepgram wins on speaker count (it has word-level evidence).
 #   - User corrections are detected and applied immediately.
-#   - The deep cycle's long-form transcript corrects fast-cycle diarization errors.
+#   - The deep cycle's long-form transcript corrects fast diarization errors.
 #
 # =============================================================================
 
@@ -89,7 +98,8 @@ OPENROUTER_API_KEY  = "YOUR_OPENROUTER_API_KEY"
 AUDIO_ANALYSIS_MODEL = "google/gemini-3-flash-preview"   # Must support audio input
 ROUTER_MODEL = "google/gemini-2.0-flash-001"           # Fast text model for intent gating
 CONVERSATION_MODEL = "google/gemini-2.0-flash-001"     # Model for conversation responses
-CONVERSATION_MAX_TOKENS = 300             
+SUMMARY_MODEL = "google/gemini-2.0-flash-001"          # Model for text summarization
+CONVERSATION_MAX_TOKENS = 300
 
 DEEPGRAM_URL = "https://api.deepgram.com/v1/listen"
 OPENROUTER_URL = "https://openrouter.ai/api/v1/chat/completions"
@@ -136,7 +146,7 @@ CORRECTION_PATTERNS = [
     r"(wasn'?t|not)\s+talking\s+to\s+you",
     r"(stop|quit|be quiet|shut up|enough)",
     r"i\s+(didn'?t|never)\s+say\s+that",
-    r"there\s+(aren'?t|isn'?t|are\s+only|is\s+only)\s+\d+",
+    r"ther(aren'?t|isn'?t|are\s+only|is\s+only)\s+\d+",
 ]
 
 SAMPLE_RATE = 16000
@@ -160,7 +170,7 @@ PERSONALITY_PROMPT = (
     "{conversation_context}"
     "LAST 15 SECONDS OF SPEECH:\n{recent_speech}\n\n"
     "NOTABLE EVENTS (timestamped):\n{event_log}\n\n"
-    "CORRECTIONS (things you got wrong — do NOT repeat these):\n{corrections}\n\n"
+    "CORRECTIONS (things you got wrong — do NOT repeat them):\n{corrections}\n\n"
     "Rules:\n"
     "- Speak naturally. Read aloud. No markdown.\n"
     "- 1-3 sentences unless asked for detail.\n"
@@ -266,7 +276,7 @@ DEEP_GEMINI_PROMPT = (
     "Use relative timestamps (~0:30, ~1:15, ~2:45) to indicate WHEN things happen.\n\n"
     "Reply in this format:\n"
     "VOICES: [number] — [description of each voice]\n"
-    "NAMES_HEARD: [name — who said it — ~timestamp]\n"
+    "NAMES_HEARD: [name — said it — ~timestamp]\n"
     "BACKGROUND: [sounds with ~timestamps]\n"
     "EMOTIONAL_ARC: [how mood changes across the 3 minutes]\n"
     "PHYSICAL_ACTIVITY: [what's happening in the room]\n"
@@ -291,7 +301,7 @@ class EnhancedListenerCapability(MatchingCapability):
     room_state: dict = {}               # Canonical: rewritten each cycle
     conversation_summary: str = ""       # Running summary: chains across 3-min blocks
     recent_speech: list = []             # Rolling buffer of last N speech lines
-    corrections: list = []               # Recent corrections detected
+    corrections: list = []              # Recent corrections detected
     enhanced_context: list = []          # Full log for dashboard only
     event_log: list = []                 # Rolling timestamped notable events
     voice_profiles: dict = {}            # {speaker_id: {gender, age, name, voice, emotion, role}}
@@ -318,7 +328,7 @@ class EnhancedListenerCapability(MatchingCapability):
     deep_cycle_id: int = 0
     _cycle_data: dict = {}
 
-    #{{register_capability}}
+    #{{register capability}}
 
     def call(self, worker: AgentWorker):
         self.worker = worker
@@ -389,13 +399,8 @@ class EnhancedListenerCapability(MatchingCapability):
         return f"{h}:{t.tm_min:02d} {'AM' if t.tm_hour < 12 else 'PM'}"
 
     def fire_confirm(self, fn: str):
-        async def _p():
-            try:
-                await self.capability_worker.play_from_audio_file(fn)
-                self.log(f"[AUDIO] Played {fn}")
-            except Exception as e:
-                self.log_error(f"[AUDIO] {fn}: {e}")
-        self.worker.session_tasks.create(_p())
+        """Play a confirmation sound. Silently skips if file doesn't exist."""
+        pass
 
     def _add_to_log(self, entry_type: str, data: str):
         """Append to the full log (for dashboard). NOT used for LLM context."""
@@ -1200,14 +1205,11 @@ class EnhancedListenerCapability(MatchingCapability):
     # =========================================================================
 
     async def respond(self, user_input: str):
-        t0 = time.time()
-
         if self._is_real_estate_query(user_input):
             await self.trigger_amn(user_input)
-            self.conversation_history.append({"role": "user", "content": user_input})
-            self.conversation_history.append({"role": "assistant", "content": "[AMN workflow executed]"})
             return
 
+        t0 = time.time()
         sys_prompt = self.build_context()
         hist = self.conversation_history[-MAX_HISTORY_MESSAGES:]
         ctx_len = len(sys_prompt)
@@ -1342,7 +1344,7 @@ class EnhancedListenerCapability(MatchingCapability):
                 # Check for corrections
                 self.detect_corrections(filtered)
 
-                self.log(f"[DG] ✓ Final ({len(filtered)} chars)")
+                self.log(f"[DG] Final ({len(filtered)} chars)")
 
             cd["dg_done"] = True
             self._check_fast_complete(cid)
@@ -1437,7 +1439,7 @@ class EnhancedListenerCapability(MatchingCapability):
                  "dg_only" if cd.get("dg_raw") else \
                  "gemini_only" if cd.get("gemini_raw") else "both_failed"
 
-        self.log(f"[FAST] ✓ Cycle {cid} — {status} | Room: {self.room_state.get('speaker_count')} speakers | Fusion: {fusion_note}")
+        self.log(f"[FAST] Cycle {cid} — {status} | Room: {self.room_state.get('speaker_count')} speakers | Fusion: {fusion_note}")
 
         if self.engagement_state == "IDLE":
             self.fire_confirm("confirm.mp3")
@@ -1767,7 +1769,7 @@ class EnhancedListenerCapability(MatchingCapability):
                     "total_chunks": len(self.history_chunks),
                 })
 
-                self.log(f"[DEEP] ✓ Cycle {dcid} complete ({total_elapsed:.1f}s total)")
+                self.log(f"[DEEP] Cycle {dcid} complete ({total_elapsed:.1f}s total)")
                 self.log(f"[DEEP]   DG:{dg_elapsed:.1f}s Gem:{gem_elapsed:.1f}s LLM:{ext_elapsed:.1f}s")
                 self.log(f"[DEEP]   Voices: {list(self.voice_profiles.keys())}")
                 self.log(f"[DEEP]   Names: {self.room_state.get('known_names', [])}")
@@ -1881,12 +1883,16 @@ class EnhancedListenerCapability(MatchingCapability):
                     done, pend = await asyncio.wait({lt, tt}, return_when=asyncio.FIRST_COMPLETED)
                     for t in pend:
                         t.cancel()
-                        try: await t
-                        except: pass
+                        try:
+                            await t
+                        except Exception:
+                            pass
 
                     if lt in done:
-                        try: ui = lt.result()
-                        except: ui = None
+                        try:
+                            ui = lt.result()
+                        except Exception:
+                            ui = None
                         if not ui or len(ui.strip()) < 2:
                             continue
                         self.log(f"[ENGAGED] Heard: '{ui}'")
@@ -1950,12 +1956,16 @@ class EnhancedListenerCapability(MatchingCapability):
                     done, pend = await asyncio.wait({lt, ct}, return_when=asyncio.FIRST_COMPLETED)
                     for t in pend:
                         t.cancel()
-                        try: await t
-                        except: pass
+                        try:
+                            await t
+                        except Exception:
+                            pass
 
                     if lt in done:
-                        try: ui = lt.result()
-                        except: ui = None
+                        try:
+                            ui = lt.result()
+                        except Exception:
+                            ui = None
                         if not ui or len(ui.strip()) < 2:
                             continue
                         self.log(f"[COOLDOWN] Heard: '{ui}'")
@@ -1989,16 +1999,20 @@ class EnhancedListenerCapability(MatchingCapability):
                         done2, pend2 = await asyncio.wait({cf, cft}, return_when=asyncio.FIRST_COMPLETED)
                         for t in pend2:
                             t.cancel()
-                            try: await t
-                            except: pass
+                            try:
+                                await t
+                            except Exception:
+                                pass
 
                         if cf in done2:
-                            try: conf = cf.result()
-                            except: conf = ""
+                            try:
+                                conf = cf.result()
+                            except Exception:
+                                conf = ""
                             self.log(f"[COOLDOWN] Confirmation: '{conf}'")
                             if conf:
                                 lo = conf.lower().strip()
-                                yes = ["yes","yeah","yep","yea","sure","uh huh","mhm","mm hmm","go ahead"]
+                                yes = ["yes", "yeah", "yep", "yea", "sure", "uh huh", "mhm", "mm hmm", "go ahead"]
                                 if any(w in lo for w in yes):
                                     self._post_state_change("COOLDOWN", "ENGAGED", "clarification_yes", conf)
                                     self.last_engagement_time = time.time()
@@ -2018,16 +2032,15 @@ class EnhancedListenerCapability(MatchingCapability):
     # AMN INTEGRATION
     # =========================================================================
 
-    _REAL_ESTATE_KEYWORDS = [
+    _REAL_ESTATE_KEYWORDS = {
         "home", "house", "property", "listing", "listings", "buy", "buying",
         "mortgage", "budget", "neighborhood", "realtor", "apartment", "condo",
-        "bedroom", "squirrel hill", "pittsburgh", "move", "tour", "zillow",
-        "lease", "rent", "rental", "broker", "mls", "open house", "inspection",
-    ]
+        "bedroom", "squirrel hill", "pittsburgh", "move", "tour", "willow",
+    }
 
     def _is_real_estate_query(self, text: str) -> bool:
-        lower = text.lower()
-        return any(kw in lower for kw in self._REAL_ESTATE_KEYWORDS)
+        words = set(text.lower().split())
+        return bool(words & self._REAL_ESTATE_KEYWORDS)
 
     async def trigger_amn(self, user_input: str):
         self.log("[AMN] Real estate query detected — launching AMN workflow")
@@ -2046,7 +2059,7 @@ class EnhancedListenerCapability(MatchingCapability):
                 f"Workflow complete in {len(logs)} steps: {', '.join(actions[-3:])}."
             )
         else:
-            await self.speak("Workflow hit an issue — more info needed from the buyer.")
+            await self.speak("Workflow hit an issue — info needed from the buyer.")
 
     # =========================================================================
     # MAIN
@@ -2054,11 +2067,6 @@ class EnhancedListenerCapability(MatchingCapability):
 
     async def run_main(self):
         try:
-            try:
-                await self.capability_worker.play_from_audio_file("intro.mp3")
-            except Exception:
-                pass
-
             await self.speak(
                 "Enhanced listener online. "
                 "I'll be quietly observing the room. "
@@ -2138,9 +2146,9 @@ class EnhancedListenerCapability(MatchingCapability):
 # Merged into this file so no extra imports are needed.
 # =============================================================================
 
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 # AMN Data Structures
-# ---------------------------------------------------------------------------
+# -------------------------------------------------------------------------
 
 @dataclass
 class LifeLoggerContext:
@@ -2208,6 +2216,7 @@ _amn_embed_model = None
 def _get_embed_model():
     global _amn_embed_model
     if _amn_embed_model is None:
+        _ensure_heavy_imports()
         _amn_embed_model = SentenceTransformer("all-MiniLM-L6-v2")
     return _amn_embed_model
 
@@ -2219,6 +2228,7 @@ def _amn_embed(text: str) -> list:
     return _get_embed_model().encode(text).tolist()
 
 def _amn_cosine(a: list, b: list) -> float:
+    _ensure_heavy_imports()
     a, b = np.array(a), np.array(b)
     d = np.linalg.norm(a) * np.linalg.norm(b)
     return float(np.dot(a, b) / d) if d else 0.0
@@ -2484,36 +2494,36 @@ def _amn_choose(state: str, ctx: BuyerContext, policy: dict, mode: str) -> tuple
 
 _AMN_PROFILES = [
     {"profile": "first_time_buyer", "ideal_path": [
-        ("UNDERSTAND_BUYER","ask_clarifying_question"), ("QUALIFY_LEAD","qualify_lead"),
-        ("SEARCH_OPTIONS","search_listings"), ("FILTER_OPTIONS","filter_listings"),
-        ("RANK_OPTIONS","rank_listings"), ("CONTACT_BUYER","send_message"),
-        ("SCHEDULE_TOUR","schedule_tour"), ("UPDATE_CRM","update_crm")]},
+        ("UNDERSTAND_BUYER", "ask_clarifying_question"), ("QUALIFY_LEAD", "qualify_lead"),
+        ("SEARCH_OPTIONS", "search_listings"), ("FILTER_OPTIONS", "filter_listings"),
+        ("RANK_OPTIONS", "rank_listings"), ("CONTACT_BUYER", "send_message"),
+        ("SCHEDULE_TOUR", "schedule_tour"), ("UPDATE_CRM", "update_crm")]},
     {"profile": "investor", "ideal_path": [
-        ("QUALIFY_LEAD","qualify_lead"), ("SEARCH_OPTIONS","search_listings"),
-        ("FILTER_OPTIONS","filter_listings"), ("RANK_OPTIONS","rank_listings"),
-        ("CONTACT_BUYER","send_message"), ("UPDATE_CRM","update_crm")]},
+        ("QUALIFY_LEAD", "qualify_lead"), ("SEARCH_OPTIONS", "search_listings"),
+        ("FILTER_OPTIONS", "filter_listings"), ("RANK_OPTIONS", "rank_listings"),
+        ("CONTACT_BUYER", "send_message"), ("UPDATE_CRM", "update_crm")]},
     {"profile": "relocation", "ideal_path": [
-        ("UNDERSTAND_BUYER","ask_clarifying_question"), ("QUALIFY_LEAD","qualify_lead"),
-        ("SEARCH_OPTIONS","search_listings"), ("RANK_OPTIONS","rank_listings"),
-        ("CONTACT_BUYER","send_message"), ("SCHEDULE_TOUR","schedule_tour"),
-        ("UPDATE_CRM","update_crm")]},
+        ("UNDERSTAND_BUYER", "ask_clarifying_question"), ("QUALIFY_LEAD", "qualify_lead"),
+        ("SEARCH_OPTIONS", "search_listings"), ("RANK_OPTIONS", "rank_listings"),
+        ("CONTACT_BUYER", "send_message"), ("SCHEDULE_TOUR", "schedule_tour"),
+        ("UPDATE_CRM", "update_crm")]},
     {"profile": "upgrade", "ideal_path": [
-        ("UNDERSTAND_BUYER","ask_clarifying_question"), ("QUALIFY_LEAD","qualify_lead"),
-        ("SEARCH_OPTIONS","search_listings"), ("FILTER_OPTIONS","filter_listings"),
-        ("RANK_OPTIONS","rank_listings"), ("SCHEDULE_TOUR","schedule_tour"),
-        ("UPDATE_CRM","update_crm")]},
+        ("UNDERSTAND_BUYER", "ask_clarifying_question"), ("QUALIFY_LEAD", "qualify_lead"),
+        ("SEARCH_OPTIONS", "search_listings"), ("FILTER_OPTIONS", "filter_listings"),
+        ("RANK_OPTIONS", "rank_listings"), ("SCHEDULE_TOUR", "schedule_tour"),
+        ("UPDATE_CRM", "update_crm")]},
 ]
 
 _AMN_ALTS = {
-    "UNDERSTAND_BUYER": ["ask_clarifying_question","extract_requirements"],
-    "QUALIFY_LEAD":     ["qualify_lead","ask_clarifying_question"],
-    "SEARCH_OPTIONS":   ["search_listings","ask_clarifying_question"],
-    "FILTER_OPTIONS":   ["filter_listings","search_listings"],
-    "RANK_OPTIONS":     ["rank_listings","filter_listings"],
-    "CONTACT_BUYER":    ["send_message","check_calendar"],
-    "SCHEDULE_TOUR":    ["schedule_tour","check_calendar","send_message"],
-    "UPDATE_CRM":       ["update_crm","send_message"],
-    "RECOVER":          ["ask_clarifying_question","extract_requirements"],
+    "UNDERSTAND_BUYER": ["ask_clarifying_question", "extract_requirements"],
+    "QUALIFY_LEAD":     ["qualify_lead", "ask_clarifying_question"],
+    "SEARCH_OPTIONS":   ["search_listings", "ask_clarifying_question"],
+    "FILTER_OPTIONS":   ["filter_listings", "search_listings"],
+    "RANK_OPTIONS":     ["rank_listings", "filter_listings"],
+    "CONTACT_BUYER":    ["send_message", "check_calendar"],
+    "SCHEDULE_TOUR":    ["schedule_tour", "check_calendar", "send_message"],
+    "UPDATE_CRM":       ["update_crm", "send_message"],
+    "RECOVER":          ["ask_clarifying_question", "extract_requirements"],
 }
 
 def _amn_synth_step(num, state, action, next_state, success):
@@ -2549,7 +2559,7 @@ def _amn_bootstrap():
               for p in _AMN_PROFILES for i in range(10)]
     policy = {}
     for t in traces:
-        policy = _amn_update_markov(policy, t, task_success=True)
+        policy = _amn_update_markov(policy, t, success=True)
     buckets = _amn_seed_buckets()
     _amn_store_save(buckets, policy)
 
